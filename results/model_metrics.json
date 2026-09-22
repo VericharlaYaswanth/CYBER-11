@@ -1,0 +1,54 @@
+{
+  "train_years": "2021-2023",
+  "test_years": "2024-2025",
+  "train_records": 124852,
+  "test_records": 259496,
+  "positive_train": 804,
+  "positive_test": 1387,
+  "logistic_baseline": {
+    "roc_auc": 0.9267369682068141,
+    "pr_auc": 0.28098764054598213,
+    "precision": 0.02294105449678599,
+    "recall": 0.8774333093006489,
+    "f1_score": 0.04471305753545448,
+    "confusion_matrix": [
+      [
+        206277,
+        51832
+      ],
+      [
+        170,
+        1217
+      ]
+    ]
+  },
+  "gradient_boosting": {
+    "roc_auc": 0.9435065889889978,
+    "pr_auc": 0.20526254747173253,
+    "precision": 0.02679656400586633,
+    "recall": 0.9221341023792358,
+    "f1_score": 0.05207972799641672,
+    "confusion_matrix": [
+      [
+        211658,
+        46451
+      ],
+      [
+        108,
+        1279
+      ]
+    ]
+  },
+  "selected_model": "HistGradientBoostingClassifier",
+  "features": [
+    "year",
+    "month",
+    "epss",
+    "percentile",
+    "epss_logit",
+    "cvss_score",
+    "cvss_normalized",
+    "cvss_version_num"
+  ],
+  "priority_formula": "60% ML probability + 25% EPSS + 15% normalized CVSS"
+}

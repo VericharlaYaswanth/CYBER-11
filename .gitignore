@@ -1,0 +1,38 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment variables / secrets
+.env
+.env.*
+
+# Jupyter temporary files
+.ipynb_checkpoints/
+
+# Raw / temporary data
+data/raw/
+*.zip
+
+# Temporary files
+*.tmp
+*.log
+
+
+
+# IDE / editor files
+.vscode/
+.idea/
+
+# Large generated/intermediate datasets
+data/epss_combined.csv
+data/ml_dataset.csv
+data/vulnerability_dataset.csv
+
+# Yearly EPSS source files
+data/epss/
