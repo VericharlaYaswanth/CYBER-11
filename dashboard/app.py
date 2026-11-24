@@ -1,9 +1,31 @@
-import json
+import sys
 import os
+import json
+import hashlib
+import secrets
 
 import joblib
 import pandas as pd
 import streamlit as st
+
+
+# ============================================================
+# PROJECT PATH CONFIGURATION
+# ============================================================
+
+PROJECT_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..")
+)
+
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+
+# ============================================================
+# AUTHENTICATION IMPORT
+# ============================================================
+
+from auth import login, logout, get_role
 
 
 # ============================================================
@@ -18,15 +40,35 @@ st.set_page_config(
 
 
 # ============================================================
-# PATHS
+# AUTHENTICATION
 # ============================================================
 
-BASE = os.path.abspath(
-    os.path.join(
-        os.path.dirname(__file__),
-        ".."
-    )
+if not login():
+    st.stop()
+
+current_role = get_role()
+
+st.sidebar.markdown("---")
+
+st.sidebar.write(
+    f"👤 User: {st.session_state.get('username', 'Unknown')}"
 )
+
+st.sidebar.write(
+    f"🔐 Role: {current_role}"
+)
+
+if st.sidebar.button("Logout"):
+
+    logout()
+    st.rerun()
+
+
+# ============================================================
+# PROJECT PATHS
+# ============================================================
+
+BASE = PROJECT_ROOT
 
 DATA = os.path.join(
     BASE,
@@ -52,6 +94,33 @@ IMPORTANCE = os.path.join(
     "feature_importance.csv"
 )
 
+EXPLANATIONS = os.path.join(
+    BASE,
+    "results",
+    "vulnerability_explanations.csv"
+)
+
+RECOMMENDATIONS = os.path.join(
+    BASE,
+    "results",
+    "remediation_recommendations.csv"
+)
+
+PRIORITIZED = os.path.join(
+    BASE,
+    "results",
+    "prioritized_vulnerabilities.csv"
+)
+
+AUTH_FILE = os.path.join(
+    BASE,
+    "auth_config.json"
+)
+
+
+# ============================================================
+# MODEL FEATURES
+# ============================================================
 
 FEATURES = [
     "year",
@@ -60,9 +129,27 @@ FEATURES = [
     "percentile",
     "epss_logit",
     "cvss_score",
-    "cvss_normalized",
-    "cvss_version_num"
+    "cvss_version_num",
+    "cvss_missing"
 ]
+
+
+# ============================================================
+# HELPER FUNCTION
+# ============================================================
+
+def safe_number(value, default=0):
+
+    try:
+
+        if pd.isna(value):
+            return default
+
+        return float(value)
+
+    except (TypeError, ValueError):
+
+        return default
 
 
 # ============================================================
@@ -74,9 +161,12 @@ def load_data():
 
     df = pd.read_csv(DATA)
 
-    df["snapshot_date"] = pd.to_datetime(
-        df["snapshot_date"]
-    )
+    if "snapshot_date" in df.columns:
+
+        df["snapshot_date"] = pd.to_datetime(
+            df["snapshot_date"],
+            errors="coerce"
+        )
 
     return df
 
@@ -92,50 +182,154 @@ def load_model():
 
 
 # ============================================================
-# CALCULATE SCORES
+# LOAD OPTIONAL FILES
+# ============================================================
+
+@st.cache_data
+def load_optional_csv(path):
+
+    if not os.path.exists(path):
+        return pd.DataFrame()
+
+    try:
+
+        return pd.read_csv(path)
+
+    except Exception:
+
+        return pd.DataFrame()
+
+
+# ============================================================
+# BUILD PRIORITY SCORES
 # ============================================================
 
 def build_scores(df):
 
-    model = load_model()
-
     df = df.copy()
 
+    model = load_model()
+
+    # --------------------------------------------------------
+    # VALIDATE FEATURES
+    # --------------------------------------------------------
+
+    missing_features = [
+        feature
+        for feature in FEATURES
+        if feature not in df.columns
+    ]
+
+    if missing_features:
+
+        raise ValueError(
+            "Missing model features: "
+            + ", ".join(missing_features)
+        )
+
+    # --------------------------------------------------------
+    # PREPARE MODEL INPUT
+    # --------------------------------------------------------
+
+    for feature in FEATURES:
+
+        df[feature] = pd.to_numeric(
+            df[feature],
+            errors="coerce"
+        )
+
+    model_input = df[FEATURES].copy()
+
+    model_input = model_input.fillna(0)
+
+    # --------------------------------------------------------
+    # ML EXPLOIT PROBABILITY
+    # --------------------------------------------------------
+
     df["predicted_exploit_probability"] = (
-        model.predict_proba(
-            df[FEATURES]
-        )[:, 1]
+        model.predict_proba(model_input)[:, 1]
     )
+
+    # --------------------------------------------------------
+    # ML SCORE
+    # --------------------------------------------------------
+
+    df["ml_score"] = (
+        df["predicted_exploit_probability"] * 100
+    )
+
+    # --------------------------------------------------------
+    # EPSS SCORE
+    # --------------------------------------------------------
+
+    df["epss_score"] = (
+
+        pd.to_numeric(
+            df["epss"],
+            errors="coerce"
+        )
+
+        .fillna(0)
+
+        .clip(0, 1)
+
+        * 100
+    )
+
+    # --------------------------------------------------------
+    # CVSS NORMALIZATION
+    # --------------------------------------------------------
+
+    df["cvss_normalized"] = (
+
+        pd.to_numeric(
+            df["cvss_score"],
+            errors="coerce"
+        )
+
+        .fillna(0)
+
+        .clip(0, 10)
+
+        * 10
+    )
+
+    # --------------------------------------------------------
+    # COMPOSITE PRIORITY SCORE
+    # --------------------------------------------------------
 
     df["priority_score"] = (
 
-        0.60 *
-        df["predicted_exploit_probability"]
+        0.60 * df["ml_score"]
 
         +
 
-        0.25 *
-        df["epss"]
+        0.25 * df["epss_score"]
 
         +
 
-        0.15 *
-        (
-            df["cvss_score"] / 10
-        )
+        0.15 * df["cvss_normalized"]
 
-    ) * 100
+    )
+
+    df["priority_score"] = (
+        df["priority_score"].clip(0, 100)
+    )
+
+    # --------------------------------------------------------
+    # PRIORITY CLASSIFICATION
+    # --------------------------------------------------------
 
     df["priority"] = pd.cut(
 
         df["priority_score"],
 
         bins=[
-            -1,
+            -float("inf"),
             25,
             50,
             75,
-            101
+            float("inf")
         ],
 
         labels=[
@@ -143,20 +337,160 @@ def build_scores(df):
             "Medium",
             "High",
             "Critical"
-        ]
+        ],
+
+        right=False
+
     )
 
     return df
 
 
 # ============================================================
-# CHECK REQUIRED FILES
+# MERGE EXPLANATIONS
+# ============================================================
+
+def merge_explanations(df):
+
+    df = df.copy()
+
+    explanation_df = load_optional_csv(
+        EXPLANATIONS
+    )
+
+    if (
+        not explanation_df.empty
+        and "cve" in explanation_df.columns
+    ):
+
+        explanation_columns = [
+            "cve",
+            "explanation",
+            "risk_summary"
+        ]
+
+        available_columns = [
+            column
+            for column in explanation_columns
+            if column in explanation_df.columns
+        ]
+
+        explanation_df = explanation_df[
+            available_columns
+        ].copy()
+
+        explanation_df["cve"] = (
+            explanation_df["cve"].astype(str)
+        )
+
+        explanation_df = explanation_df.drop_duplicates(
+            subset=["cve"],
+            keep="first"
+        )
+
+        df["cve"] = df["cve"].astype(str)
+
+        df = df.merge(
+            explanation_df,
+            on="cve",
+            how="left"
+        )
+
+    return df
+
+
+# ============================================================
+# MERGE REMEDIATION
+# ============================================================
+
+def merge_remediation(df):
+
+    df = df.copy()
+
+    remediation_df = load_optional_csv(
+        RECOMMENDATIONS
+    )
+
+    if (
+        not remediation_df.empty
+        and "cve" in remediation_df.columns
+    ):
+
+        remediation_columns = [
+            "cve",
+            "remediation_action",
+            "remediation_urgency"
+        ]
+
+        available_columns = [
+            column
+            for column in remediation_columns
+            if column in remediation_df.columns
+        ]
+
+        remediation_df = remediation_df[
+            available_columns
+        ].copy()
+
+        remediation_df["cve"] = (
+            remediation_df["cve"].astype(str)
+        )
+
+        remediation_df = remediation_df.drop_duplicates(
+            subset=["cve"],
+            keep="first"
+        )
+
+        df["cve"] = df["cve"].astype(str)
+
+        df = df.merge(
+            remediation_df,
+            on="cve",
+            how="left"
+        )
+
+    return df
+
+
+# ============================================================
+# EXPLOITATION STATUS
+# ============================================================
+
+def add_exploitation_status(df):
+
+    df = df.copy()
+
+    if "exploited" in df.columns:
+
+        df["known_exploited"] = (
+
+            pd.to_numeric(
+                df["exploited"],
+                errors="coerce"
+            )
+
+            .fillna(0)
+
+            .astype(int)
+
+            == 1
+        )
+
+    else:
+
+        df["known_exploited"] = False
+
+    return df
+
+
+# ============================================================
+# REQUIRED FILE CHECKS
 # ============================================================
 
 if not os.path.exists(DATA):
 
     st.error(
-        "ml_features.csv is missing."
+        "Dataset file ml_features.csv is missing."
     )
 
     st.stop()
@@ -165,36 +499,100 @@ if not os.path.exists(DATA):
 if not os.path.exists(MODEL):
 
     st.error(
-        "exploit_model.pkl is missing."
+        "Trained model exploit_model.pkl is missing."
     )
 
     st.stop()
 
 
 # ============================================================
-# LOAD
+# LOAD AND PROCESS DATA
 # ============================================================
 
-df = build_scores(
-    load_data()
-)
+try:
 
-latest_date = df[
-    "snapshot_date"
-].max()
+    df = load_data()
 
-latest = df[
-    df["snapshot_date"] == latest_date
-].copy()
+    df = build_scores(df)
+
+    df = merge_explanations(df)
+
+    df = merge_remediation(df)
+
+    df = add_exploitation_status(df)
+
+except Exception as error:
+
+    st.error(
+        f"Error loading dashboard data: {error}"
+    )
+
+    st.stop()
+
+
+# ============================================================
+# VALIDATE REQUIRED DATA COLUMNS
+# ============================================================
+
+required_columns = [
+    "cve",
+    "epss",
+    "cvss_score",
+    "priority",
+    "priority_score",
+    "predicted_exploit_probability"
+]
+
+missing_columns = [
+    column
+    for column in required_columns
+    if column not in df.columns
+]
+
+if missing_columns:
+
+    st.error(
+        "Required dataset columns are missing: "
+        + ", ".join(missing_columns)
+    )
+
+    st.stop()
+
+
+# ============================================================
+# LATEST SNAPSHOT
+# ============================================================
+
+if "snapshot_date" in df.columns:
+
+    valid_dates = df["snapshot_date"].dropna()
+
+    if not valid_dates.empty:
+
+        latest_date = valid_dates.max()
+
+        latest = df[
+            df["snapshot_date"] == latest_date
+        ].copy()
+
+    else:
+
+        latest_date = "Unavailable"
+
+        latest = df.copy()
+
+else:
+
+    latest_date = "Unavailable"
+
+    latest = df.copy()
 
 
 # ============================================================
 # HEADER
 # ============================================================
 
-st.title(
-    "🛡️ CYBER-11"
-)
+st.title("🛡️ CYBER-11")
 
 st.subheader(
     "Vulnerability Prioritization "
@@ -203,17 +601,16 @@ st.subheader(
 
 st.caption(
     "EPSS + CVSS + Machine Learning "
-    "| Temporal evaluation on 2024–2025"
+    "| Temporal Evaluation on 2024–2025"
 )
 
 st.markdown(
-    f"**Latest snapshot:** "
-    f"{latest_date.date()}"
+    f"**Latest snapshot:** {latest_date}"
 )
 
 
 # ============================================================
-# SIDEBAR
+# SIDEBAR FILTERS
 # ============================================================
 
 st.sidebar.header(
@@ -227,31 +624,28 @@ search_cve = st.sidebar.text_input(
 
 min_epss = st.sidebar.slider(
     "Minimum EPSS",
-    0.0,
-    1.0,
-    0.0,
-    0.01
+    min_value=0.0,
+    max_value=1.0,
+    value=0.0,
+    step=0.01
 )
 
 min_cvss = st.sidebar.slider(
     "Minimum CVSS",
-    0.0,
-    10.0,
-    0.0,
-    0.5
+    min_value=0.0,
+    max_value=10.0,
+    value=0.0,
+    step=0.5
 )
 
 priority_filter = st.sidebar.multiselect(
-
     "Priority",
-
     [
         "Critical",
         "High",
         "Medium",
         "Low"
     ],
-
     default=[
         "Critical",
         "High",
@@ -265,23 +659,30 @@ priority_filter = st.sidebar.multiselect(
 # FILTER DATA
 # ============================================================
 
-filtered = latest[
-    (latest["epss"] >= min_epss)
-    &
-    (latest["cvss_score"] >= min_cvss)
-    &
-    (
-        latest["priority"]
-        .astype(str)
-        .isin(priority_filter)
-    )
+filtered = latest.copy()
+
+# EPSS filter
+filtered = filtered[
+    filtered["epss"].fillna(0) >= min_epss
 ].copy()
 
+# CVSS filter
+filtered = filtered[
+    filtered["cvss_score"].fillna(0) >= min_cvss
+].copy()
 
+# Priority filter
+filtered = filtered[
+    filtered["priority"]
+    .astype(str)
+    .isin(priority_filter)
+].copy()
+
+# CVE search
 if search_cve:
 
-    search_results = latest[
-        latest["cve"]
+    filtered = filtered[
+        filtered["cve"]
         .astype(str)
         .str.contains(
             search_cve,
@@ -289,8 +690,6 @@ if search_cve:
             na=False
         )
     ].copy()
-
-    filtered = search_results
 
 
 # ============================================================
@@ -322,7 +721,7 @@ c4.metric(
     "Avg EPSS",
     (
         f"{filtered['epss'].mean():.3f}"
-        if len(filtered)
+        if not filtered.empty
         else "0"
     )
 )
@@ -331,7 +730,7 @@ c5.metric(
     "Avg CVSS",
     (
         f"{filtered['cvss_score'].mean():.2f}"
-        if len(filtered)
+        if not filtered.empty
         else "0"
     )
 )
@@ -370,8 +769,11 @@ with tab1:
         )
 
         priority_counts = (
+
             filtered["priority"]
+
             .value_counts()
+
             .reindex(
                 [
                     "Critical",
@@ -380,13 +782,14 @@ with tab1:
                     "Low"
                 ]
             )
+
             .fillna(0)
+
         )
 
         st.bar_chart(
             priority_counts
         )
-
 
     # --------------------------------------------------------
     # EPSS VS CVSS
@@ -398,7 +801,7 @@ with tab1:
             "### EPSS vs CVSS"
         )
 
-        if len(filtered):
+        if not filtered.empty:
 
             chart = filtered[
                 [
@@ -406,12 +809,10 @@ with tab1:
                     "cvss_score"
                 ]
             ].rename(
-
                 columns={
                     "epss": "EPSS",
                     "cvss_score": "CVSS"
                 }
-
             )
 
             st.scatter_chart(
@@ -420,14 +821,18 @@ with tab1:
                 y="CVSS"
             )
 
+        else:
+
+            st.info(
+                "No data available for the selected filters."
+            )
 
     # --------------------------------------------------------
     # TOP VULNERABILITIES
     # --------------------------------------------------------
 
     st.markdown(
-        "### 🚨 Top Vulnerabilities "
-        "Requiring Attention"
+        "### 🚨 Top Vulnerabilities Requiring Attention"
     )
 
     show_cols = [
@@ -440,51 +845,77 @@ with tab1:
         "priority"
     ]
 
+    if "known_exploited" in filtered.columns:
+
+        show_cols.append(
+            "known_exploited"
+        )
+
+    available_show_cols = [
+        column
+        for column in show_cols
+        if column in filtered.columns
+    ]
+
     top = (
+
         filtered
+
         .sort_values(
             "priority_score",
             ascending=False
         )
+
         .head(50)
+
         .copy()
+
     )
 
-    top[
-        "predicted_exploit_probability"
-    ] = (
-        top[
-            "predicted_exploit_probability"
-        ] * 100
-    ).round(2)
+    if not top.empty:
 
-    top[
-        "priority_score"
-    ] = top[
-        "priority_score"
-    ].round(2)
+        top["predicted_exploit_probability"] = (
+            top["predicted_exploit_probability"] * 100
+        ).round(2)
 
-    st.dataframe(
-        top[show_cols],
-        use_container_width=True,
-        hide_index=True
-    )
+        top["priority_score"] = (
+            top["priority_score"].round(2)
+        )
 
+        st.dataframe(
+            top[available_show_cols],
+            use_container_width=True,
+            hide_index=True
+        )
+
+    else:
+
+        st.info(
+            "No vulnerabilities match the selected filters."
+        )
 
     # --------------------------------------------------------
-    # DOWNLOAD
+    # CSV DOWNLOAD — RBAC
     # --------------------------------------------------------
 
-    csv_data = filtered.to_csv(
-        index=False
-    ).encode("utf-8")
+    if current_role in ["Admin", "Analyst"]:
 
-    st.download_button(
-        label="⬇️ Download Filtered Vulnerabilities",
-        data=csv_data,
-        file_name="cyber11_filtered_vulnerabilities.csv",
-        mime="text/csv"
-    )
+        csv_data = filtered.to_csv(
+            index=False
+        ).encode("utf-8")
+
+        st.download_button(
+            label="⬇️ Download Filtered Vulnerabilities",
+            data=csv_data,
+            file_name="cyber11_filtered_vulnerabilities.csv",
+            mime="text/csv"
+        )
+
+    else:
+
+        st.info(
+            "Viewer role: Download functionality is disabled."
+        )
 
 
 # ============================================================
@@ -497,15 +928,22 @@ with tab2:
         "## 🔍 Vulnerability Details"
     )
 
-    if search_cve and len(filtered):
+    if search_cve and not filtered.empty:
+
+        cve_list = (
+            filtered["cve"]
+            .astype(str)
+            .unique()
+            .tolist()
+        )
 
         selected_cve = st.selectbox(
             "Select CVE",
-            filtered["cve"].tolist()
+            cve_list
         )
 
         vulnerability = filtered[
-            filtered["cve"] == selected_cve
+            filtered["cve"].astype(str) == selected_cve
         ].iloc[0]
 
         st.markdown(
@@ -516,34 +954,43 @@ with tab2:
 
         a.metric(
             "EPSS",
-            f"{vulnerability['epss']:.4f}"
+            f"{safe_number(vulnerability['epss']):.4f}"
         )
 
         b.metric(
             "CVSS",
-            f"{vulnerability['cvss_score']:.1f}"
+            f"{safe_number(vulnerability['cvss_score']):.1f}"
         )
 
         c.metric(
             "Priority Score",
-            f"{vulnerability['priority_score']:.2f}"
+            f"{safe_number(vulnerability['priority_score']):.2f}"
         )
+
+        # ----------------------------------------------------
+        # EXPLOIT LIKELIHOOD
+        # ----------------------------------------------------
 
         st.markdown(
             "### Exploit Likelihood"
         )
 
+        probability = safe_number(
+            vulnerability["predicted_exploit_probability"]
+        )
+
+        probability = max(
+            0.0,
+            min(1.0, probability)
+        )
+
         st.progress(
-            float(
-                vulnerability[
-                    "predicted_exploit_probability"
-                ]
-            )
+            probability
         )
 
         st.write(
             f"Predicted exploit probability: "
-            f"**{vulnerability['predicted_exploit_probability'] * 100:.2f}%**"
+            f"**{probability * 100:.2f}%**"
         )
 
         st.write(
@@ -551,38 +998,136 @@ with tab2:
             f"**{vulnerability['priority']}**"
         )
 
+        # ----------------------------------------------------
+        # EXPLOITATION STATUS
+        # ----------------------------------------------------
+
+        st.markdown(
+            "### Known Exploitation Status"
+        )
+
+        if vulnerability.get(
+            "known_exploited",
+            False
+        ):
+
+            st.warning(
+                "⚠️ This vulnerability is identified as exploited."
+            )
+
+        else:
+
+            st.info(
+                "No known exploited status is available "
+                "in the current dataset."
+            )
+
+        # ----------------------------------------------------
+        # RISK COMPONENTS
+        # ----------------------------------------------------
+
         st.markdown(
             "### Risk Components"
         )
 
-        details = pd.DataFrame({
+        details = pd.DataFrame(
+            {
+                "Component": [
+                    "ML Exploit Likelihood",
+                    "EPSS",
+                    "CVSS"
+                ],
 
-            "Component": [
-                "ML Exploit Likelihood",
-                "EPSS",
-                "CVSS"
-            ],
+                "Value": [
+                    probability * 100,
 
-            "Value": [
-                vulnerability[
-                    "predicted_exploit_probability"
-                ] * 100,
+                    safe_number(
+                        vulnerability["epss"]
+                    ) * 100,
 
-                vulnerability[
-                    "epss"
-                ] * 100,
-
-                vulnerability[
-                    "cvss_score"
-                ] * 10
-            ]
-        })
+                    safe_number(
+                        vulnerability["cvss_score"]
+                    ) * 10
+                ]
+            }
+        )
 
         st.bar_chart(
-            details.set_index(
-                "Component"
-            )
+            details.set_index("Component")
         )
+
+        # ----------------------------------------------------
+        # EXPLAINABILITY
+        # ----------------------------------------------------
+
+        st.markdown(
+            "### 🧠 Risk Explanation"
+        )
+
+        if (
+            "risk_summary" in vulnerability.index
+            and pd.notna(vulnerability["risk_summary"])
+        ):
+
+            st.write(
+                vulnerability["risk_summary"]
+            )
+
+        elif (
+            "explanation" in vulnerability.index
+            and pd.notna(vulnerability["explanation"])
+        ):
+
+            st.write(
+                vulnerability["explanation"]
+            )
+
+        else:
+
+            st.write(
+                f"This vulnerability received a priority score of "
+                f"{safe_number(vulnerability['priority_score']):.2f}/100. "
+                f"The score combines machine-learning exploit likelihood, "
+                f"EPSS, and CVSS severity."
+            )
+
+        # ----------------------------------------------------
+        # REMEDIATION
+        # ----------------------------------------------------
+
+        st.markdown(
+            "### 🛠️ Recommended Remediation"
+        )
+
+        if (
+            "remediation_action" in vulnerability.index
+            and pd.notna(vulnerability["remediation_action"])
+        ):
+
+            st.write(
+                vulnerability["remediation_action"]
+            )
+
+        else:
+
+            st.info(
+                "Remediation recommendation is unavailable. "
+                "Run remediation.py to generate recommendations."
+            )
+
+        # ----------------------------------------------------
+        # REMEDIATION URGENCY
+        # ----------------------------------------------------
+
+        if (
+            "remediation_urgency" in vulnerability.index
+            and pd.notna(vulnerability["remediation_urgency"])
+        ):
+
+            st.write(
+                "**Remediation Urgency:** "
+                f"{vulnerability['remediation_urgency']}"
+            )
 
     elif search_cve:
 
@@ -593,8 +1138,8 @@ with tab2:
     else:
 
         st.info(
-            "Enter a CVE in the sidebar "
-            "to view detailed vulnerability information."
+            "Enter a CVE in the sidebar to view "
+            "detailed vulnerability information."
         )
 
 
@@ -608,64 +1153,120 @@ with tab3:
         "## 🤖 Machine Learning Analysis"
     )
 
+    # --------------------------------------------------------
+    # MODEL METRICS
+    # --------------------------------------------------------
+
     if os.path.exists(METRICS):
 
-        with open(
-            METRICS,
-            "r",
-            encoding="utf-8"
-        ) as file:
+        try:
 
-            metrics = json.load(file)
+            with open(
+                METRICS,
+                "r",
+                encoding="utf-8"
+            ) as file:
 
-        model_metrics = metrics[
-            "gradient_boosting"
-        ]
+                metrics = json.load(file)
 
-        a, b, c, d = st.columns(4)
+            best_model_name = metrics.get(
+                "best_model",
+                "Logistic Regression"
+            )
 
-        a.metric(
-            "ROC-AUC",
-            f"{model_metrics['roc_auc']:.4f}"
+            results = metrics.get(
+                "results",
+                []
+            )
+
+            model_metrics = next(
+                (
+                    result
+                    for result in results
+                    if result.get("Model") == best_model_name
+                ),
+                None
+            )
+
+            if model_metrics is not None:
+
+                st.write(
+                    f"**Best Model:** {best_model_name}"
+                )
+
+                a, b, c, d = st.columns(4)
+
+                a.metric(
+                    "ROC-AUC",
+                    f"{model_metrics.get('ROC_AUC', 0):.4f}"
+                )
+
+                b.metric(
+                    "PR-AUC",
+                    f"{model_metrics.get('PR_AUC', 0):.4f}"
+                )
+
+                c.metric(
+                    "Precision",
+                    f"{model_metrics.get('Precision', 0):.4f}"
+                )
+
+                d.metric(
+                    "Recall",
+                    f"{model_metrics.get('Recall', 0):.4f}"
+                )
+
+                e, f, g = st.columns(3)
+
+                e.metric(
+                    "Accuracy",
+                    f"{model_metrics.get('Accuracy', 0):.4f}"
+                )
+
+                f.metric(
+                    "F1 Score",
+                    f"{model_metrics.get('F1', 0):.4f}"
+                )
+
+                g.metric(
+                    "Selected Model",
+                    best_model_name
+                )
+
+            else:
+
+                st.warning(
+                    "Best model metrics could not be found "
+                    "in model_metrics.json."
+                )
+
+        except Exception as error:
+
+            st.error(
+                f"Error reading model metrics: {error}"
+            )
+
+    else:
+
+        st.warning(
+            "Model metrics file not found."
         )
 
-        b.metric(
-            "PR-AUC",
-            f"{model_metrics['pr_auc']:.4f}"
-        )
+    # --------------------------------------------------------
+    # MODEL CONFIGURATION
+    # --------------------------------------------------------
 
-        c.metric(
-            "Precision",
-            f"{model_metrics['precision']:.4f}"
-        )
+    st.markdown(
+        "### Model Configuration"
+    )
 
-        d.metric(
-            "Recall",
-            f"{model_metrics['recall']:.4f}"
-        )
+    st.write(
+        "Training period: **2021–2023**"
+    )
 
-        st.markdown(
-            "### Model Configuration"
-        )
-
-        st.write(
-            "Training period: **2021–2023**"
-        )
-
-        st.write(
-            "Testing period: **2024–2025**"
-        )
-
-        st.write(
-            f"Training records: "
-            f"**{metrics['train_records']:,}**"
-        )
-
-        st.write(
-            f"Testing records: "
-            f"**{metrics['test_records']:,}**"
-        )
-
+    st.write(
+        "Testing period: **2024–2025**"
+    )
 
     # --------------------------------------------------------
     # FEATURE IMPORTANCE
@@ -677,28 +1278,45 @@ with tab3:
 
     if os.path.exists(IMPORTANCE):
 
-        importance = pd.read_csv(
-            IMPORTANCE
-        )
+        try:
 
-        importance = importance.sort_values(
-            "importance_mean",
-            ascending=False
-        )
+            importance = pd.read_csv(
+                IMPORTANCE
+            )
 
-        st.bar_chart(
-            importance.set_index(
-                "feature"
-            )[
-                "importance_mean"
-            ]
-        )
+            if (
+                "importance_mean" in importance.columns
+                and "feature" in importance.columns
+            ):
 
-        st.dataframe(
-            importance,
-            use_container_width=True,
-            hide_index=True
-        )
+                importance = importance.sort_values(
+                    "importance_mean",
+                    ascending=False
+                )
+
+                st.bar_chart(
+                    importance.set_index("feature")[
+                        "importance_mean"
+                    ]
+                )
+
+                st.dataframe(
+                    importance,
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+            else:
+
+                st.warning(
+                    "Feature importance file has an unexpected format."
+                )
+
+        except Exception as error:
+
+            st.error(
+                f"Error loading feature importance: {error}"
+            )
 
     else:
 
@@ -706,7 +1324,6 @@ with tab3:
             "Feature importance file not found. "
             "Run feature_importance.py first."
         )
-
 
     # --------------------------------------------------------
     # PRIORITY FORMULA
@@ -769,17 +1386,21 @@ vulnerabilities that require attention.
         """
 EPSS + CVSS + Historical Data
               ↓
-       Feature Engineering
+        Feature Engineering
               ↓
-     Machine Learning Model
+      Machine Learning Model
               ↓
-   Exploit-Likelihood Prediction
+    Exploit-Likelihood Prediction
               ↓
-       Priority Score
+       Composite Priority Score
               ↓
-      Risk Classification
+       Risk Classification
               ↓
-         Dashboard
+      Explainability Analysis
+              ↓
+   Remediation Recommendations
+              ↓
+          Dashboard
         """
     )
 
@@ -788,17 +1409,210 @@ EPSS + CVSS + Historical Data
     )
 
     st.write(
-        "**Critical:** Priority score > 75"
+        "**Critical:** Priority score ≥ 75"
     )
 
     st.write(
-        "**High:** Priority score 50–75"
+        "**High:** Priority score 50–74.99"
     )
 
     st.write(
-        "**Medium:** Priority score 25–50"
+        "**Medium:** Priority score 25–49.99"
     )
 
     st.write(
-        "**Low:** Priority score ≤ 25"
+        "**Low:** Priority score < 25"
     )
+
+    st.markdown(
+        "### Composite Scoring Weights"
+    )
+
+    st.write(
+        "- Machine Learning Exploit Probability: **60%**"
+    )
+
+    st.write(
+        "- EPSS: **25%**"
+    )
+
+    st.write(
+        "- Normalized CVSS: **15%**"
+    )
+
+
+# ============================================================
+# ADMIN PANEL
+# ============================================================
+
+if current_role == "Admin":
+
+    st.sidebar.markdown("---")
+
+    st.sidebar.markdown(
+        "## ⚙️ Admin Panel"
+    )
+
+    with st.sidebar.expander(
+        "👥 User Management",
+        expanded=False
+    ):
+
+        # ----------------------------------------------------
+        # LOAD AUTH CONFIG
+        # ----------------------------------------------------
+
+        try:
+
+            with open(
+                AUTH_FILE,
+                "r",
+                encoding="utf-8"
+            ) as file:
+
+                auth_config = json.load(file)
+
+        except Exception:
+
+            auth_config = {
+                "users": {}
+            }
+
+        users = auth_config.get(
+            "users",
+            {}
+        )
+
+        # ----------------------------------------------------
+        # CREATE USER
+        # ----------------------------------------------------
+
+        st.markdown(
+            "### Create User"
+        )
+
+        new_username = st.text_input(
+            "Username",
+            key="admin_new_username"
+        )
+
+        new_password = st.text_input(
+            "Password",
+            type="password",
+            key="admin_new_password"
+        )
+
+        new_role = st.selectbox(
+            "Role",
+            [
+                "Admin",
+                "Analyst",
+                "Viewer"
+            ],
+            key="admin_new_role"
+        )
+
+        if st.button(
+            "Create User",
+            key="admin_create_user"
+        ):
+
+            username = new_username.strip()
+
+            if not username:
+
+                st.error(
+                    "Username cannot be empty."
+                )
+
+            elif username in users:
+
+                st.error(
+                    "Username already exists."
+                )
+
+            elif len(new_password) < 8:
+
+                st.error(
+                    "Password must contain at least 8 characters."
+                )
+
+            else:
+
+                salt = secrets.token_hex(16)
+
+                password_hash = hashlib.pbkdf2_hmac(
+                    "sha256",
+                    new_password.encode("utf-8"),
+                    salt.encode("utf-8"),
+                    200000
+                ).hex()
+
+                users[username] = {
+                    "password_hash": f"{salt}:{password_hash}",
+                    "role": new_role
+                }
+
+                auth_config["users"] = users
+
+                try:
+
+                    with open(
+                        AUTH_FILE,
+                        "w",
+                        encoding="utf-8"
+                    ) as file:
+
+                        json.dump(
+                            auth_config,
+                            file,
+                            indent=4
+                        )
+
+                    st.success(
+                        f"User '{username}' created successfully."
+                    )
+
+                    st.rerun()
+
+                except Exception as error:
+
+                    st.error(
+                        f"Could not save user: {error}"
+                    )
+
+        # ----------------------------------------------------
+        # EXISTING USERS
+        # ----------------------------------------------------
+
+        st.markdown(
+            "### Existing Users"
+        )
+
+        if users:
+
+            user_display = pd.DataFrame(
+                [
+                    {
+                        "Username": username,
+                        "Role": details.get(
+                            "role",
+                            "Unknown"
+                        )
+                    }
+
+                    for username, details in users.items()
+                ]
+            )
+
+            st.dataframe(
+                user_display,
+                use_container_width=True,
+                hide_index=True
+            )
+
+        else:
+
+            st.info(
+                "No users found."
+            )

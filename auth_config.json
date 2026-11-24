@@ -1,0 +1,16 @@
+{
+    "users": {
+        "admin": {
+            "password_hash": "abf35b2832b271a2a0ff4557998b8f64:f360348c3683ca5007ae3976a56fa9e6bb18fa4e5f6caadfe30e37968aa011bf",
+            "role": "Admin"
+        },
+        "analyst": {
+            "password_hash": "e96dfa007aa3888afc04d7fd8ee920ae:380d9ddac35f804677e1676076fe8f8527f1cfe4a51e2cd5e0ef792377d1ff5c",
+            "role": "Analyst"
+        },
+        "viewer": {
+            "password_hash": "557f8aeb95f8c8999076346049116312:c9d4ae02f470e0e6e816f53cf61a9f9e92114bb0ebeb85570d0b16b4a5d8cbd3",
+            "role": "Viewer"
+        }
+    }
+}

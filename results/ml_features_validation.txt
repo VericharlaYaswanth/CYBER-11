@@ -1,0 +1,25 @@
+VALIDATION REPORT: ML Features
+======================================================================
+Rows: 384348
+Columns: 12
+
+Column names:
+['cve', 'snapshot_date', 'year', 'month', 'epss', 'percentile', 'epss_logit', 'cvss_score', 'cvss_normalized', 'cvss_version_num', 'cvss_severity', 'exploited']
+
+Missing values:
+cve                 0
+snapshot_date       0
+year                0
+month               0
+epss                0
+percentile          0
+epss_logit          0
+cvss_score          0
+cvss_normalized     0
+cvss_version_num    0
+cvss_severity       0
+exploited           0
+dtype: int64
+
+Duplicate rows:
+0

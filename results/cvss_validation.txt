@@ -1,0 +1,16 @@
+VALIDATION REPORT: CVSS
+======================================================================
+Rows: 166829
+Columns: 3
+
+Column names:
+['cve', 'cvss_score', 'cvss_version']
+
+Missing values:
+cve                0
+cvss_score      8684
+cvss_version    8684
+dtype: int64
+
+Duplicate rows:
+0

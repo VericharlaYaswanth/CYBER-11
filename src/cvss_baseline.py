@@ -1,49 +1,121 @@
+from pathlib import Path
 import pandas as pd
+import json
 
-INPUT_FILE = "data/vulnerability_dataset.csv"
-OUTPUT_FILE = "results/cvss_baseline.csv"
+from sklearn.metrics import (
+    roc_auc_score,
+    average_precision_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    accuracy_score,
+    classification_report,
+    confusion_matrix
+)
+
+ROOT = Path(__file__).resolve().parent.parent
+
+INPUT_FILE = ROOT / "data" / "ml_features.csv"
+OUTPUT_DIR = ROOT / "results"
+
+OUTPUT_DIR.mkdir(exist_ok=True)
 
 
-def create_baseline():
+def evaluate_cvss_baseline():
+
+    print("=" * 60)
+    print("CVSS BASELINE EVALUATION")
+    print("=" * 60)
 
     df = pd.read_csv(INPUT_FILE)
 
-    # Rank vulnerabilities using CVSS only
-    df["cvss_priority_score"] = df["cvss_score"]
+    # Temporal test data
+    test = df[df["year"] >= 2024].copy()
 
-    # Create priority category
-    def classify(score):
-        if score >= 9.0:
-            return "Critical"
-        elif score >= 7.0:
-            return "High"
-        elif score >= 4.0:
-            return "Medium"
+    # Remove records without CVSS score
+    test = test.dropna(subset=["cvss_score"])
+
+    y_true = test["exploited"]
+
+    # CVSS score normalized to probability-like ranking
+    scores = test["cvss_score"] / 10.0
+
+    # Classification threshold
+    predictions = (test["cvss_score"] >= 7.0).astype(int)
+
+    metrics = {
+        "Model": "CVSS Baseline",
+        "Accuracy": accuracy_score(y_true, predictions),
+        "ROC_AUC": roc_auc_score(y_true, scores),
+        "PR_AUC": average_precision_score(y_true, scores),
+        "Precision": precision_score(
+            y_true, predictions, zero_division=0
+        ),
+        "Recall": recall_score(
+            y_true, predictions, zero_division=0
+        ),
+        "F1": f1_score(
+            y_true, predictions, zero_division=0
+        )
+    }
+
+    print("\nTest records:", len(test))
+
+    print("\nCVSS Baseline Metrics:")
+    for key, value in metrics.items():
+        if isinstance(value, float):
+            print(f"{key}: {value:.4f}")
         else:
-            return "Low"
+            print(f"{key}: {value}")
 
-    df["cvss_priority"] = df["cvss_score"].apply(classify)
-
-    # Highest CVSS first
-    df = df.sort_values(
-        by="cvss_priority_score",
-        ascending=False
-    )
-
-    df.to_csv(OUTPUT_FILE, index=False)
-
-    print("CVSS baseline created.")
-    print(f"Records: {len(df)}")
-    print("\nPriority distribution:")
-    print(df["cvss_priority"].value_counts())
-
-    print("\nTop 10 vulnerabilities:")
+    print("\nClassification Report:")
     print(
-        df[
-            ["cve", "cvss_score", "epss", "cvss_priority"]
-        ].head(10)
+        classification_report(
+            y_true,
+            predictions,
+            zero_division=0
+        )
     )
+
+    print("\nConfusion Matrix:")
+    cm = confusion_matrix(y_true, predictions)
+    print(cm)
+
+    # Save metrics
+    pd.DataFrame([metrics]).to_csv(
+        OUTPUT_DIR / "cvss_baseline_metrics.csv",
+        index=False
+    )
+
+    pd.DataFrame(
+        cm,
+        index=["Actual 0", "Actual 1"],
+        columns=["Predicted 0", "Predicted 1"]
+    ).to_csv(
+        OUTPUT_DIR / "cvss_baseline_confusion_matrix.csv"
+    )
+
+    # Save predictions
+    test["cvss_prediction"] = scores
+    test["cvss_predicted_label"] = predictions
+
+    test[
+        ["cve", "year", "cvss_score", "exploited",
+         "cvss_prediction", "cvss_predicted_label"]
+    ].to_csv(
+        OUTPUT_DIR / "cvss_baseline_predictions.csv",
+        index=False
+    )
+
+    with open(
+        OUTPUT_DIR / "cvss_baseline_metrics.json",
+        "w"
+    ) as f:
+        json.dump(metrics, f, indent=4)
+
+    print("\nFiles saved successfully in results/")
+    print("CVSS baseline evaluation completed!")
 
 
 if __name__ == "__main__":
-    create_baseline()
+    evaluate_cvss_baseline()

@@ -1,29 +1,39 @@
-import json
-import os
-import joblib
-import numpy as np
 import pandas as pd
+import numpy as np
+import joblib
+import json
 
-from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (
-    average_precision_score,
-    classification_report,
-    confusion_matrix,
-    f1_score,
-    precision_score,
-    recall_score,
-    roc_auc_score
-)
+from pathlib import Path
+
 from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
 
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import HistGradientBoostingClassifier
 
-INPUT_FILE = "data/ml_features.csv"
-MODEL_FILE = "models/exploit_model.pkl"
-METRICS_FILE = "results/model_metrics.json"
-PREDICTIONS_FILE = "results/model_predictions.csv"
+from sklearn.metrics import (
+    roc_auc_score,
+    average_precision_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    accuracy_score,
+    confusion_matrix,
+    classification_report
+)
+
+
+ROOT = Path(__file__).resolve().parent.parent
+
+INPUT_FILE = ROOT / "data" / "ml_features.csv"
+
+MODEL_DIR = ROOT / "models"
+RESULTS_DIR = ROOT / "results"
+
+MODEL_DIR.mkdir(exist_ok=True)
+RESULTS_DIR.mkdir(exist_ok=True)
+
 
 FEATURES = [
     "year",
@@ -32,428 +42,50 @@ FEATURES = [
     "percentile",
     "epss_logit",
     "cvss_score",
-    "cvss_normalized",
-    "cvss_version_num"
+    "cvss_version_num",
+    "cvss_missing"
 ]
 
 
-def evaluate(model, X, y):
+def evaluate_model(name, model, X_test, y_test):
 
-    probability = model.predict_proba(X)[:, 1]
+    predictions = model.predict(X_test)
 
-    prediction = (
-        probability >= 0.5
-    ).astype(int)
+    probabilities = model.predict_proba(X_test)[:, 1]
 
     metrics = {
-        "roc_auc": float(
-            roc_auc_score(y, probability)
+        "Model": name,
+        "Accuracy": accuracy_score(y_test, predictions),
+        "ROC_AUC": roc_auc_score(y_test, probabilities),
+        "PR_AUC": average_precision_score(y_test, probabilities),
+        "Precision": precision_score(
+            y_test,
+            predictions,
+            zero_division=0
         ),
-        "pr_auc": float(
-            average_precision_score(y, probability)
+        "Recall": recall_score(
+            y_test,
+            predictions,
+            zero_division=0
         ),
-        "precision": float(
-            precision_score(
-                y,
-                prediction,
-                zero_division=0
-            )
-        ),
-        "recall": float(
-            recall_score(
-                y,
-                prediction,
-                zero_division=0
-            )
-        ),
-        "f1_score": float(
-            f1_score(
-                y,
-                prediction,
-                zero_division=0
-            )
+        "F1": f1_score(
+            y_test,
+            predictions,
+            zero_division=0
         )
     }
 
-    cm = confusion_matrix(y, prediction)
+    print("\n" + "=" * 60)
+    print(f"MODEL RESULTS: {name}")
+    print("=" * 60)
 
-    metrics["confusion_matrix"] = cm.tolist()
+    for metric, value in metrics.items():
 
-    return metrics, probability, prediction
+        if metric != "Model":
 
+            print(f"{metric}: {value:.6f}")
 
-def create_priority_score(df):
-
-    df = df.copy()
-
-    df["priority_score"] = (
-        0.60 *
-        df["predicted_exploit_probability"]
-        +
-        0.25 *
-        df["epss"]
-        +
-        0.15 *
-        (
-            df["cvss_score"] / 10.0
-        )
-    ) * 100
-
-    df["priority"] = pd.cut(
-        df["priority_score"],
-        bins=[
-            -1,
-            25,
-            50,
-            75,
-            101
-        ],
-        labels=[
-            "Low",
-            "Medium",
-            "High",
-            "Critical"
-        ]
-    )
-
-    return df
-
-
-def train_model():
-
-    print("\nLoading feature dataset...")
-
-    df = pd.read_csv(INPUT_FILE)
-
-    df["snapshot_date"] = pd.to_datetime(
-        df["snapshot_date"]
-    )
-
-    # ------------------------------------------------
-    # TEMPORAL TRAIN / TEST SPLIT
-    # ------------------------------------------------
-
-    train_mask = df["year"] <= 2023
-    test_mask = df["year"] >= 2024
-
-    X_train = df.loc[
-        train_mask,
-        FEATURES
-    ]
-
-    y_train = df.loc[
-        train_mask,
-        "exploited"
-    ]
-
-    X_test = df.loc[
-        test_mask,
-        FEATURES
-    ]
-
-    y_test = df.loc[
-        test_mask,
-        "exploited"
-    ]
-
-    print(
-        f"Training records: {len(X_train):,}"
-    )
-
-    print(
-        f"Testing records:  {len(X_test):,}"
-    )
-
-    print(
-        f"Training exploited rate: "
-        f"{y_train.mean() * 100:.3f}%"
-    )
-
-    print(
-        f"Testing exploited rate: "
-        f"{y_test.mean() * 100:.3f}%"
-    )
-
-    # ------------------------------------------------
-    # LOGISTIC REGRESSION BASELINE
-    # ------------------------------------------------
-
-    logistic = Pipeline([
-        (
-            "imputer",
-            SimpleImputer(
-                strategy="median"
-            )
-        ),
-        (
-            "scaler",
-            StandardScaler()
-        ),
-        (
-            "classifier",
-            LogisticRegression(
-                class_weight="balanced",
-                max_iter=1000
-            )
-        )
-    ])
-
-    # ------------------------------------------------
-    # GRADIENT BOOSTING MODEL
-    # ------------------------------------------------
-
-    gradient = Pipeline([
-        (
-            "imputer",
-            SimpleImputer(
-                strategy="median"
-            )
-        ),
-        (
-            "classifier",
-            HistGradientBoostingClassifier(
-                max_iter=180,
-                learning_rate=0.08,
-                max_leaf_nodes=31,
-                l2_regularization=1.0,
-                random_state=42
-            )
-        )
-    ])
-
-    # ------------------------------------------------
-    # HANDLE CLASS IMBALANCE
-    # ------------------------------------------------
-
-    positive = int(
-        y_train.sum()
-    )
-
-    negative = int(
-        len(y_train) - positive
-    )
-
-    positive_weight = (
-        negative /
-        max(positive, 1)
-    )
-
-    sample_weight = np.where(
-        y_train.to_numpy() == 1,
-        positive_weight,
-        1.0
-    )
-
-    print(
-        f"\nPositive training samples: "
-        f"{positive:,}"
-    )
-
-    print(
-        f"Negative training samples: "
-        f"{negative:,}"
-    )
-
-    # ------------------------------------------------
-    # TRAIN MODELS
-    # ------------------------------------------------
-
-    print("\nTraining Logistic Regression...")
-
-    logistic.fit(
-        X_train,
-        y_train
-    )
-
-    print(
-        "Training Gradient Boosting..."
-    )
-
-    gradient.fit(
-        X_train,
-        y_train,
-        classifier__sample_weight=sample_weight
-    )
-
-    # ------------------------------------------------
-    # EVALUATION
-    # ------------------------------------------------
-
-    logistic_metrics, _, _ = evaluate(
-        logistic,
-        X_test,
-        y_test
-    )
-
-    gradient_metrics, probabilities, predictions = evaluate(
-        gradient,
-        X_test,
-        y_test
-    )
-
-    print("\n==============================")
-    print("MODEL RESULTS")
-    print("==============================")
-
-    print("\nLogistic Regression")
-
-    for key, value in logistic_metrics.items():
-
-        if key != "confusion_matrix":
-            print(
-                f"{key}: {value:.4f}"
-            )
-
-    print(
-        "\nGradient Boosting"
-    )
-
-    for key, value in gradient_metrics.items():
-
-        if key != "confusion_matrix":
-            print(
-                f"{key}: {value:.4f}"
-            )
-
-    # ------------------------------------------------
-    # SAVE MODEL
-    # ------------------------------------------------
-
-    os.makedirs(
-        "models",
-        exist_ok=True
-    )
-
-    os.makedirs(
-        "results",
-        exist_ok=True
-    )
-
-    joblib.dump(
-        gradient,
-        MODEL_FILE
-    )
-
-    # ------------------------------------------------
-    # CREATE TEST PREDICTIONS
-    # ------------------------------------------------
-
-    test_output = df.loc[
-        test_mask,
-        [
-            "cve",
-            "snapshot_date",
-            "epss",
-            "percentile",
-            "cvss_score",
-            "exploited"
-        ]
-    ].copy()
-
-    test_output[
-        "predicted_exploit_probability"
-    ] = probabilities
-
-    test_output = create_priority_score(
-        test_output
-    )
-
-    test_output = test_output.sort_values(
-        "priority_score",
-        ascending=False
-    )
-
-    test_output.to_csv(
-        PREDICTIONS_FILE,
-        index=False
-    )
-
-    # ------------------------------------------------
-    # SAVE METRICS
-    # ------------------------------------------------
-
-    metrics = {
-
-        "train_years": "2021-2023",
-
-        "test_years": "2024-2025",
-
-        "train_records":
-            int(len(X_train)),
-
-        "test_records":
-            int(len(X_test)),
-
-        "positive_train":
-            int(y_train.sum()),
-
-        "positive_test":
-            int(y_test.sum()),
-
-        "logistic_baseline":
-            logistic_metrics,
-
-        "gradient_boosting":
-            gradient_metrics,
-
-        "selected_model":
-            "HistGradientBoostingClassifier",
-
-        "features":
-            FEATURES,
-
-        "priority_formula":
-            "60% ML probability + "
-            "25% EPSS + "
-            "15% normalized CVSS"
-    }
-
-    with open(
-        METRICS_FILE,
-        "w",
-        encoding="utf-8"
-    ) as file:
-
-        json.dump(
-            metrics,
-            file,
-            indent=2
-        )
-
-    # ------------------------------------------------
-    # FINAL OUTPUT
-    # ------------------------------------------------
-
-    print(
-        "\n=============================="
-    )
-
-    print(
-        "CYBER-11 MODEL TRAINING COMPLETE"
-    )
-
-    print(
-        "=============================="
-    )
-
-    print(
-        f"\nROC-AUC: "
-        f"{gradient_metrics['roc_auc']:.4f}"
-    )
-
-    print(
-        f"PR-AUC: "
-        f"{gradient_metrics['pr_auc']:.4f}"
-    )
-
-    print(
-        f"F1 Score: "
-        f"{gradient_metrics['f1_score']:.4f}"
-    )
-
-    print(
-        "\nClassification Report:"
-    )
+    print("\nClassification Report:")
 
     print(
         classification_report(
@@ -463,26 +95,278 @@ def train_model():
         )
     )
 
-    print(
-        "\nConfusion Matrix:"
+    print("\nConfusion Matrix:")
+
+    cm = confusion_matrix(y_test, predictions)
+
+    print(cm)
+
+    return metrics, predictions, probabilities, cm
+
+
+def train_model():
+
+    print("Loading dataset...")
+
+    df = pd.read_csv(INPUT_FILE)
+
+    print("Dataset records:", len(df))
+
+    # --------------------------------------------------
+    # DATA PREPARATION
+    # --------------------------------------------------
+
+    df["year"] = pd.to_numeric(
+        df["year"],
+        errors="coerce"
     )
 
-    print(
-        confusion_matrix(
-            y_test,
-            predictions
+    df["exploited"] = pd.to_numeric(
+        df["exploited"],
+        errors="coerce"
+    )
+
+    df = df.dropna(
+        subset=["year", "exploited"]
+    )
+
+    df = df[df["exploited"].isin([0, 1])]
+
+    # --------------------------------------------------
+    # FEATURES
+    # --------------------------------------------------
+
+    X = df[FEATURES].copy()
+
+    y = df["exploited"].astype(int)
+
+    # --------------------------------------------------
+    # TEMPORAL SPLIT
+    # --------------------------------------------------
+
+    train_mask = df["year"] <= 2023
+
+    test_mask = df["year"] >= 2024
+
+    X_train = X.loc[train_mask]
+
+    X_test = X.loc[test_mask]
+
+    y_train = y.loc[train_mask]
+
+    y_test = y.loc[test_mask]
+
+    print("\nTemporal Split")
+    print("-" * 40)
+
+    print("Training records:", len(X_train))
+
+    print("Testing records:", len(X_test))
+
+    print("\nTraining years:")
+    print(df.loc[train_mask, "year"].value_counts().sort_index())
+
+    print("\nTesting years:")
+    print(df.loc[test_mask, "year"].value_counts().sort_index())
+
+    print("\nTraining target distribution:")
+    print(y_train.value_counts())
+
+    print("\nTesting target distribution:")
+    print(y_test.value_counts())
+
+    if len(X_train) == 0 or len(X_test) == 0:
+
+        raise ValueError(
+            "Temporal split produced an empty train or test dataset."
         )
+
+    if y_train.nunique() < 2:
+
+        raise ValueError(
+            "Training dataset contains only one target class."
+        )
+
+    if y_test.nunique() < 2:
+
+        raise ValueError(
+            "Testing dataset contains only one target class."
+        )
+
+    # --------------------------------------------------
+    # MODEL 1: LOGISTIC REGRESSION
+    # --------------------------------------------------
+
+    logistic_model = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+
+        ("scaler", StandardScaler()),
+
+        (
+            "classifier",
+            LogisticRegression(
+                class_weight="balanced",
+                max_iter=2000,
+                random_state=42
+            )
+        )
+    ])
+
+    # --------------------------------------------------
+    # MODEL 2: HISTOGRAM GRADIENT BOOSTING
+    # --------------------------------------------------
+
+    boosting_model = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+
+        (
+            "classifier",
+            HistGradientBoostingClassifier(
+                max_iter=200,
+                learning_rate=0.1,
+                max_leaf_nodes=31,
+                random_state=42
+            )
+        )
+    ])
+
+    models = {
+        "Logistic Regression": logistic_model,
+        "HistGradientBoosting": boosting_model
+    }
+
+    results = []
+
+    model_objects = {}
+
+    # --------------------------------------------------
+    # TRAIN AND EVALUATE
+    # --------------------------------------------------
+
+    for name, model in models.items():
+
+        print("\n")
+        print("=" * 60)
+        print("TRAINING:", name)
+        print("=" * 60)
+
+        model.fit(X_train, y_train)
+
+        metrics, predictions, probabilities, cm = evaluate_model(
+            name,
+            model,
+            X_test,
+            y_test
+        )
+
+        results.append(metrics)
+
+        model_objects[name] = model
+
+        # Save confusion matrix
+        cm_file = RESULTS_DIR / (
+            name.lower().replace(" ", "_")
+            + "_confusion_matrix.csv"
+        )
+
+        pd.DataFrame(
+            cm,
+            index=["Actual 0", "Actual 1"],
+            columns=["Predicted 0", "Predicted 1"]
+        ).to_csv(cm_file)
+
+        # Save predictions
+        prediction_file = RESULTS_DIR / (
+            name.lower().replace(" ", "_")
+            + "_predictions.csv"
+        )
+
+        prediction_df = pd.DataFrame({
+            "actual": y_test.values,
+            "predicted": predictions,
+            "probability": probabilities
+        })
+
+        prediction_df.to_csv(
+            prediction_file,
+            index=False
+        )
+
+    # --------------------------------------------------
+    # MODEL COMPARISON
+    # --------------------------------------------------
+
+    comparison = pd.DataFrame(results)
+
+    print("\n")
+    print("=" * 60)
+    print("MODEL COMPARISON")
+    print("=" * 60)
+
+    print(comparison.to_string(index=False))
+
+    comparison_file = RESULTS_DIR / "model_comparison.csv"
+
+    comparison.to_csv(
+        comparison_file,
+        index=False
     )
 
-    print(
-        f"\nModel saved to: "
-        f"{MODEL_FILE}"
+    # --------------------------------------------------
+    # SELECT BEST MODEL BASED ON PR-AUC
+    # --------------------------------------------------
+
+    best_model_name = comparison.loc[
+        comparison["PR_AUC"].idxmax(),
+        "Model"
+    ]
+
+    best_model = model_objects[best_model_name]
+
+    print("\nBest model based on PR-AUC:")
+    print(best_model_name)
+
+    # --------------------------------------------------
+    # SAVE BEST MODEL
+    # --------------------------------------------------
+
+    best_model_file = MODEL_DIR / "exploit_model.pkl"
+
+    joblib.dump(
+        best_model,
+        best_model_file
     )
 
-    print(
-        f"Predictions saved to: "
-        f"{PREDICTIONS_FILE}"
-    )
+    print("\nBest model saved:")
+    print(best_model_file)
+
+    # --------------------------------------------------
+    # SAVE METRICS
+    # --------------------------------------------------
+
+    metrics_json = RESULTS_DIR / "model_metrics.json"
+
+    with open(
+        metrics_json,
+        "w",
+        encoding="utf-8"
+    ) as file:
+
+        json.dump(
+            {
+                "best_model": best_model_name,
+                "results": results
+            },
+            file,
+            indent=4
+        )
+
+    print("\nMetrics saved:")
+    print(metrics_json)
+
+    print("\n" + "=" * 60)
+    print("MODEL TRAINING COMPLETED")
+    print("=" * 60)
 
 
 if __name__ == "__main__":

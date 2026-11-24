@@ -1,0 +1,17 @@
+VALIDATION REPORT: EPSS
+======================================================================
+Rows: 1072784
+Columns: 4
+
+Column names:
+['cve', 'epss', 'percentile', 'snapshot_date']
+
+Missing values:
+cve              0
+epss             0
+percentile       0
+snapshot_date    0
+dtype: int64
+
+Duplicate rows:
+0

@@ -1,0 +1,20 @@
+VALIDATION REPORT: ML Dataset
+======================================================================
+Rows: 384348
+Columns: 7
+
+Column names:
+['cve', 'epss', 'percentile', 'snapshot_date', 'cvss_score', 'cvss_version', 'exploited']
+
+Missing values:
+cve              0
+epss             0
+percentile       0
+snapshot_date    0
+cvss_score       0
+cvss_version     0
+exploited        0
+dtype: int64
+
+Duplicate rows:
+0
